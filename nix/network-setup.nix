@@ -3,10 +3,10 @@
 # TAP/bridge/vhost-net setup and teardown scripts.
 # All network parameters come from constants.nix.
 #
-# Usage:
-#   nix run .#pcp-check-host        # Verify host environment
-#   nix run .#pcp-network-setup     # Create bridge + TAP + NAT
-#   nix run .#pcp-network-teardown  # Remove bridge + TAP + NAT
+# Usage (setup and teardown require sudo):
+#   nix run .#pcp-check-host             # Verify host environment
+#   sudo nix run .#pcp-network-setup     # Create bridge + TAP + NAT
+#   sudo nix run .#pcp-network-teardown  # Remove bridge + TAP + NAT
 #
 { pkgs }:
 let
@@ -77,56 +77,72 @@ in
     text = ''
       echo "=== PCP MicroVM Network Setup ==="
 
+      # Check we're running as root (via sudo)
+      if [[ $EUID -ne 0 ]]; then
+        echo "ERROR: Run with sudo: sudo nix run .#pcp-network-setup"
+        exit 1
+      fi
+
+      # Determine the actual user (not root when running via sudo)
+      REAL_USER="''${SUDO_USER:-$USER}"
+      if [[ "$REAL_USER" == "root" ]]; then
+        echo "ERROR: Run this script via 'sudo nix run .#pcp-network-setup' as a regular user"
+        echo "       The script needs to know which user should have TAP device access"
+        exit 1
+      fi
+      echo "Setting up network for user: $REAL_USER"
+
       # Load required kernel modules
-      sudo modprobe tun
-      sudo modprobe vhost_net
-      sudo modprobe bridge
+      modprobe tun
+      modprobe vhost_net
+      modprobe bridge
 
       # Create bridge
       if ! ip link show ${bridge} &>/dev/null; then
         echo "Creating bridge ${bridge}..."
-        sudo ip link add ${bridge} type bridge
-        sudo ip addr add ${gateway}/24 dev ${bridge}
-        sudo ip link set ${bridge} up
+        ip link add ${bridge} type bridge
+        ip addr add ${gateway}/24 dev ${bridge}
+        ip link set ${bridge} up
       else
         echo "Bridge ${bridge} already exists"
       fi
 
       # Create TAP device with multi_queue for vhost-net
-      if ! ip link show ${tap} &>/dev/null; then
-        echo "Creating TAP device ${tap}..."
-        sudo ip tuntap add dev ${tap} mode tap multi_queue user "$USER"
-        sudo ip link set ${tap} master ${bridge}
-        sudo ip link set ${tap} up
-      else
-        echo "TAP device ${tap} already exists"
+      # Recreate if it exists but with wrong owner
+      if ip link show ${tap} &>/dev/null; then
+        echo "Removing existing TAP device ${tap}..."
+        ip link del ${tap}
       fi
+      echo "Creating TAP device ${tap} for user $REAL_USER..."
+      ip tuntap add dev ${tap} mode tap multi_queue user "$REAL_USER"
+      ip link set ${tap} master ${bridge}
+      ip link set ${tap} up
 
       # Enable vhost-net access (secure method: ACL, fallback: group)
       # SECURITY: We avoid chmod 666 (world-writable) as it's a red flag
       if [[ -c /dev/vhost-net ]]; then
         if command -v setfacl &>/dev/null; then
           # Preferred: ACL-based per-user access
-          sudo setfacl -m "u:$USER:rw" /dev/vhost-net
-          echo "vhost-net enabled (ACL for $USER)"
-        elif getent group kvm &>/dev/null && groups | grep -q kvm; then
+          setfacl -m "u:$REAL_USER:rw" /dev/vhost-net
+          echo "vhost-net enabled (ACL for $REAL_USER)"
+        elif getent group kvm &>/dev/null; then
           # Fallback: group-based access (user must be in kvm group)
-          sudo chgrp kvm /dev/vhost-net
-          sudo chmod 660 /dev/vhost-net
+          chgrp kvm /dev/vhost-net
+          chmod 660 /dev/vhost-net
           echo "vhost-net enabled (kvm group)"
         else
           echo "WARNING: Cannot set vhost-net permissions securely"
           echo "  Option 1: Install acl package and rerun setup"
-          echo "  Option 2: Add $USER to 'kvm' group and rerun setup"
+          echo "  Option 2: Add $REAL_USER to 'kvm' group and rerun setup"
           echo "  vhost acceleration may not work"
         fi
       fi
 
       # NAT for VM internet access
       echo "Configuring NAT..."
-      sudo nft add table inet pcp-nat 2>/dev/null || true
-      sudo nft flush table inet pcp-nat 2>/dev/null || true
-      sudo nft -f - <<EOF
+      nft add table inet pcp-nat 2>/dev/null || true
+      nft flush table inet pcp-nat 2>/dev/null || true
+      nft -f - <<EOF
 table inet pcp-nat {
   chain postrouting {
     type nat hook postrouting priority 100;
@@ -141,7 +157,7 @@ table inet pcp-nat {
 EOF
 
       # Enable IP forwarding
-      sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+      sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
       echo ""
       echo "Network ready. MicroVM will be accessible at:"
@@ -154,27 +170,34 @@ EOF
 
   # Network teardown
   # Remove bridge, TAP device, and NAT rules.
+  # Run with: sudo nix run .#pcp-network-teardown
   teardown = pkgs.writeShellApplication {
     name = "pcp-network-teardown";
     runtimeInputs = with pkgs; [ iproute2 nftables ];
     text = ''
       echo "=== PCP MicroVM Network Teardown ==="
 
+      # Check we're running as root
+      if [[ $EUID -ne 0 ]]; then
+        echo "ERROR: Run with sudo: sudo nix run .#pcp-network-teardown"
+        exit 1
+      fi
+
       # Remove TAP device
       if ip link show ${tap} &>/dev/null; then
-        sudo ip link del ${tap}
+        ip link del ${tap}
         echo "Removed TAP device ${tap}"
       fi
 
       # Remove bridge
       if ip link show ${bridge} &>/dev/null; then
-        sudo ip link set ${bridge} down
-        sudo ip link del ${bridge}
+        ip link set ${bridge} down
+        ip link del ${bridge}
         echo "Removed bridge ${bridge}"
       fi
 
       # Remove NAT rules
-      sudo nft delete table inet pcp-nat 2>/dev/null && \
+      nft delete table inet pcp-nat 2>/dev/null && \
         echo "Removed NAT rules" || true
 
       echo "Network teardown complete"
