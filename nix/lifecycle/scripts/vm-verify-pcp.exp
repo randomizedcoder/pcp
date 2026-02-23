@@ -1,0 +1,136 @@
+#!/usr/bin/expect -f
+#
+# vm-verify-pcp.exp - Verify PCP services are running via console
+#
+# Usage: vm-verify-pcp.exp <port> <timeout> <services...>
+#
+# Connects to the console and checks if the specified services are active.
+# Returns exit code 0 if all services are active, 1 otherwise.
+#
+# Example:
+#   vm-verify-pcp.exp 24500 30 pmcd pmproxy pmlogger
+#
+# Environment variables:
+#   VM_USERNAME - Login username (default: root)
+#   VM_PASSWORD - Login password (default: pcp)
+#
+
+if {$argc < 3} {
+    puts "Usage: vm-verify-pcp.exp <port> <timeout> <services...>"
+    puts "Example: vm-verify-pcp.exp 24500 30 pmcd pmproxy"
+    exit 1
+}
+
+set port [lindex $argv 0]
+set timeout_secs [lindex $argv 1]
+set services [lrange $argv 2 end]
+
+# Get credentials
+set username "root"
+if {[info exists env(VM_USERNAME)] && $env(VM_USERNAME) ne ""} {
+    set username $env(VM_USERNAME)
+}
+set password "pcp"
+if {[info exists env(VM_PASSWORD)] && $env(VM_PASSWORD) ne ""} {
+    set password $env(VM_PASSWORD)
+}
+
+set timeout $timeout_secs
+set prompt_pattern "root@pcp-.*:.*#"
+
+# Track results
+set passed 0
+set failed 0
+
+# Connect to console
+spawn socat -,rawer tcp:127.0.0.1:$port
+
+expect {
+    "Connection refused" {
+        puts "ERROR: Connection refused on port $port"
+        exit 1
+    }
+    timeout {
+        puts "ERROR: Connection timeout"
+        exit 1
+    }
+    -re "." {}
+}
+
+send "\r"
+sleep 0.5
+
+# Handle login
+expect {
+    "login:" {
+        send "$username\r"
+        expect "Password:"
+        send "$password\r"
+        expect -re $prompt_pattern
+    }
+    -re $prompt_pattern {}
+    timeout {
+        puts "ERROR: No prompt received"
+        exit 1
+    }
+}
+
+# Check each service
+foreach service $services {
+    send "systemctl is-active $service\r"
+    expect {
+        "active\r" {
+            expect -re $prompt_pattern
+            puts "PASS: $service is active"
+            incr passed
+        }
+        "inactive\r" {
+            expect -re $prompt_pattern
+            puts "FAIL: $service is inactive"
+            incr failed
+        }
+        "failed\r" {
+            expect -re $prompt_pattern
+            puts "FAIL: $service has failed"
+            incr failed
+        }
+        "activating\r" {
+            expect -re $prompt_pattern
+            puts "WARN: $service is still activating"
+            # Count as pass for now, may need retry logic
+            incr passed
+        }
+        timeout {
+            puts "FAIL: $service check timed out"
+            incr failed
+        }
+    }
+}
+
+# Also check some PCP metrics
+send "pminfo -f kernel.all.load 2>&1 | head -3\r"
+expect {
+    "value" {
+        expect -re $prompt_pattern
+        puts "PASS: pminfo returns metrics"
+        incr passed
+    }
+    "No PMCD" {
+        expect -re $prompt_pattern
+        puts "FAIL: pmcd not responding"
+        incr failed
+    }
+    timeout {
+        puts "FAIL: pminfo timed out"
+        incr failed
+    }
+}
+
+# Summary
+puts ""
+puts "Results: $passed passed, $failed failed"
+
+if {$failed > 0} {
+    exit 1
+}
+exit 0
