@@ -8,110 +8,32 @@
 # waits for a shell prompt, optionally runs a command, and exits.
 #
 # Environment variables:
-#   VM_USERNAME - Login username (default: root)
-#   VM_PASSWORD - Login password (default: pcp)
+#   VM_USERNAME   - Login username (default: root)
+#   VM_PASSWORD   - Login password (default: pcp)
+#   EXPECT_DEBUG  - Enable expect debug mode
 #
 
-# Parse arguments
+source [file dirname [info script]]/vm-lib.exp
+
 if {$argc < 2} {
     puts "Usage: vm-expect.exp <port> <timeout> \[command\]"
     exit 1
 }
 
 set port [lindex $argv 0]
-set timeout_secs [lindex $argv 1]
+set timeout [lindex $argv 1]
 set command ""
 if {$argc >= 3} {
     set command [lindex $argv 2]
 }
 
-# Get credentials from environment or use defaults
-set username $env(VM_USERNAME)
-if {$username eq ""} {
-    set username "root"
-}
-set password $env(VM_PASSWORD)
-if {$password eq ""} {
-    set password "pcp"
-}
+vmlib::init
+vmlib::connect $port
+vmlib::login
 
-# Set expect timeout
-set timeout $timeout_secs
-
-# Shell prompt pattern: matches root@pcp-vm:~# or root@pcp-eval-vm:~# etc.
-set prompt_pattern "root@pcp-.*:.*#"
-
-# Connect to console
-spawn socat -,rawer tcp:127.0.0.1:$port
-
-# Wait for connection
-expect {
-    "Connection refused" {
-        puts "ERROR: Connection refused on port $port"
-        exit 1
-    }
-    timeout {
-        puts "ERROR: Connection timeout"
-        exit 1
-    }
-    -re "." {
-        # Got some output, continue
-    }
-}
-
-# Send a newline to wake up the console
-send "\r"
-sleep 0.5
-
-# Handle login or existing session
-expect {
-    "login:" {
-        # Need to log in
-        send "$username\r"
-        expect "Password:"
-        send "$password\r"
-        expect {
-            -re $prompt_pattern {
-                # Logged in successfully
-            }
-            "Login incorrect" {
-                puts "ERROR: Login failed"
-                exit 1
-            }
-            timeout {
-                puts "ERROR: Login timeout"
-                exit 1
-            }
-        }
-    }
-    -re $prompt_pattern {
-        # Already logged in
-    }
-    "Welcome to NixOS" {
-        # System just booted, wait for login prompt
-        expect "login:"
-        send "$username\r"
-        expect "Password:"
-        send "$password\r"
-        expect -re $prompt_pattern
-    }
-    timeout {
-        puts "ERROR: No prompt received within timeout"
-        exit 1
-    }
-}
-
-# Run command if provided
 if {$command ne ""} {
-    send "$command\r"
-    expect {
-        -re $prompt_pattern {
-            # Command completed
-        }
-        timeout {
-            puts "ERROR: Command timeout"
-            exit 1
-        }
+    if {![vmlib::run_cmd $command]} {
+        exit 1
     }
 }
 
