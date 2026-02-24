@@ -214,19 +214,20 @@ let
         networking.hostName = hostname;
 
         # Static IP for TAP networking
-        networking.interfaces = lib.mkIf useTap {
-          eth0 = {
-            useDHCP = false;
-            ipv4.addresses = [{
-              address = constants.network.vmIp;
-              prefixLength = 24;
-            }];
+        # Use systemd-networkd for reliable interface matching (enp* covers PCI ethernet)
+        systemd.network = lib.mkIf useTap {
+          enable = true;
+          networks."10-tap" = {
+            matchConfig.Name = "enp*";
+            networkConfig = {
+              Address = "${constants.network.vmIp}/24";
+              Gateway = constants.network.gateway;
+              DHCP = "no";
+            };
           };
         };
-        networking.defaultGateway = lib.mkIf useTap {
-          address = constants.network.gateway;
-          interface = "eth0";
-        };
+        # Disable dhcpcd to avoid conflicts with systemd-networkd
+        networking.useDHCP = lib.mkIf useTap false;
 
         # SSH Configuration
         # Default: password auth enabled for interactive testing convenience
