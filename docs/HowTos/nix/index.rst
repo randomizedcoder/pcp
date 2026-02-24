@@ -1362,10 +1362,11 @@ and produces a summary report at the end::
     ║  base          PASS      2669ms   72ms     8ms      7ms      19504ms   13284ms
     ║  eval          PASS      2588ms   63ms     7ms      7ms      26323ms   3805ms
     ║  grafana       PASS      2687ms   60ms     9ms      7ms      21594ms   4070ms
+    ║  grafana-tap   PASS      6897ms   139ms    9ms      7ms      22630ms   3324ms
     ║  bpf           PASS      2617ms   65ms     7ms      8ms      21037ms   3582ms
     ╠══════════════════════════════════════════════════════════════════════════════╣
-    ║  TOTAL: 4 passed, 0 failed                                                   ║
-    ║  Total time: 2m 29s                                                          ║
+    ║  TOTAL: 5 passed, 0 failed                                                   ║
+    ║  Total time: 3m 5s                                                           ║
     ╚══════════════════════════════════════════════════════════════════════════════╝
 
 **Timing observations:**
@@ -1383,6 +1384,11 @@ and produces a summary report at the end::
 
 - **Grafana longer services**: Grafana takes additional time to initialize
   compared to other services.
+
+- **TAP variant (grafana-tap)**: Uses direct network access (10.177.0.20) instead
+  of port forwarding. Build time is slightly longer on first run due to different
+  network configuration. Verifies BPF metrics (bpf.runq.latency, bpf.disk.all.latency)
+  in addition to Grafana/Prometheus services.
 
 **Variant-specific timeouts:**
 
