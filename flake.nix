@@ -26,6 +26,10 @@
 #   nix run .#pcp-vm-stop                   # Stop VM
 #   sudo nix run .#pcp-network-teardown     # Cleanup (requires sudo)
 #
+# Cross-compile (on x86_64-linux), then copy to the board:
+#   nix build .#pcp-riscv64                 # or .#pcp-aarch64
+#   nix copy --no-check-sigs --to ssh-ng://root@<board> ./result
+#
 # See also: ./docs/HowTos/nix/index.rst
 #
 {
@@ -57,6 +61,21 @@
         # Import modular package definition
         # Pass self for stable source hashing - see build/nix/package.nix for details
         pcp = import (nixDir + "/package.nix") { inherit pkgs; src = self; };
+
+        # Cross-compiled PCP for other 64-bit Linux architectures, built on
+        # x86_64-linux with nixpkgs' cross toolchains (see build/nix/cross.nix).
+        crossArches = lib.optionals (system == "x86_64-linux") [ "riscv64" "aarch64" ];
+        crossPackages = lib.genAttrs' crossArches (arch:
+          lib.nameValuePair "pcp-${arch}" (import (nixDir + "/cross.nix") {
+            inherit nixpkgs system; src = self; crossSystem = "${arch}-linux";
+          }));
+        # Table-driven checks (build/nix/tests/cross-test.nix)
+        crossTests = lib.genAttrs crossArches (arch:
+          import (nixDir + "/tests/cross-test.nix") {
+            inherit pkgs lib arch;
+            pcpNative = pcp;
+            pcpCross = crossPackages."pcp-${arch}";
+          });
 
         # Import shared constants and variant definitions
         constants = import (nixDir + "/constants.nix");
@@ -175,12 +194,17 @@
           // k8sManifests.packages
           # Test-all runner
           // testAll.packages
+          # Cross-compiled packages (x86_64-linux build host only)
+          // crossPackages
         );
 
         checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           vm-test = import (nixDir + "/vm-test.nix") {
             inherit pkgs pcp;
           };
+        } // lib.optionalAttrs (crossTests ? riscv64) {
+          cross-riscv64 = crossPackages.pcp-riscv64;
+          cross-riscv64-smoke = crossTests.riscv64.smoke;
         };
 
         # Import modular development shell
@@ -267,6 +291,11 @@
           // k8sTest.apps
           # Test-all runner
           // testAll.apps
+          # Cross-package board tests: nix run .#pcp-cross-test-<arch> -- <host>
+          // lib.mapAttrs' (arch: t: lib.nameValuePair "pcp-cross-test-${arch}" {
+            type = "app";
+            program = lib.getExe t.app;
+          }) crossTests
         );
       }
     );
