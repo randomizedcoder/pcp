@@ -76,6 +76,45 @@ let
   withPythonHttp = true;              # Python HTTP client (requests)
   withPerlHttp = true;                # Perl HTTP client (LWP)
 
+  # ─── Cross-compilation ─────────────────────────────────────────────────
+  # Everything gated on isCross is empty for native builds, so native
+  # derivations are unchanged.  See build/nix/cross.nix for the entry point.
+  #
+  # PCP's build runs some of its own tools (newhelp, pmieconf, pmgenmap,
+  # pmcpp, pmnsmerge).  When cross-compiling, src/include/builddefs.in takes
+  # them from an installed build-machine PCP via $PCP_DIR/etc/pcp.conf, so
+  # build one from the same source.
+  isCross = !pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform;
+  # pkgsBuildBuild, not buildPackages: the latter's toolchain wrappers target
+  # the cross host, and the result should be the plain native package.
+  pcpBuild = import ./package.nix { pkgs = pkgs.pkgsBuildBuild; inherit src; };
+  hostBinadm = if isCross then "${pcpBuild}/libexec/pcp/bin" else "$out/libexec/pcp/bin";
+
+  # configure only cross-compiles with a ./config.<target_os> file holding
+  # the answers to its run-time probes (upstream ships config.mingw only).
+  # Derive them from the target platform; only 64-bit Linux (LP64) is
+  # supported, as 32-bit time_t/off_t answers depend on glibc build flags.
+  crossConfig =
+    let hp = pkgs.stdenv.hostPlatform; in
+    assert lib.assertMsg (hp.isLinux && hp.is64bit)
+      "PCP cross-compilation is only supported for 64-bit Linux targets";
+    ''
+      sizeof_int=4
+      sizeof_long=8
+      sizeof_pointer=8
+      sizeof_suseconds_t=8
+      sizeof_time_t=8
+      bit_field_scheme=${if hp.isLittleEndian then "00000021" else "21000000"}
+      printf_p_prefix=0x
+      printf_fmt_pid=d
+      printf_fmt_size=lu
+      printf_fmt_int64=ld
+      strtoint64=strtol
+      have_procfs=true
+      have_python=true
+      have_perl=true
+    '';
+
   # ─── Source Filtering ──────────────────────────────────────────────────
   # Use cleanSourceWith to exclude build outputs and non-essential files
   # from the Nix store. This prevents accidental inclusion of result symlinks,
@@ -297,12 +336,44 @@ pkgs.stdenv.mkDerivation rec {
     # this no man pages are installed and the pmtop.1 symlink dangles.
     mkdir -p "$man/share/man/man1"
     touch "$man/share/man/man1/pcp-configure-probe.1"
+  '' + lib.optionalString isCross ''
+
+    # Cross-compiling: configure's run-time probe answers, and a build-machine
+    # PCP for the tools the build runs (see the let block above).
+    cat > config.linux <<'EOF'
+    ${crossConfig}
+    EOF
+    mkdir -p "$TMPDIR/pcp-host"
+    ln -s ${pcpBuild}/share/pcp/etc "$TMPDIR/pcp-host/etc"
+    export PCP_DIR="$TMPDIR/pcp-host"
+
+    # bind2/mk.rewrite runs the target's pmcpp.static directly rather than
+    # $(PMCPP), so point it at the build-machine pmcpp (pending upstream).
+    substituteInPlace src/pmdas/bind2/mk.rewrite \
+      --replace-fail ../../pmcpp/pmcpp.static ${hostBinadm}/pmcpp
+  '' + lib.optionalString (isCross && withBpf) ''
+
+    # BPF skeletons are generated with $(BPFTOOL), the target bpftool; use
+    # the build-machine bootstrap bpftool (as bpftool's own Makefile does).
+    substituteInPlace src/include/builddefs.in \
+      --replace-fail bpftool/src/bpftool bpftool/src/bootstrap/bpftool
   '';
+
+  # The vendored bpftool builds a bootstrap bpftool for the build machine
+  # with plain gcc, linking libelf/zlib/zstd and openssl.
+  depsBuildBuild = lib.optionals isCross (with pkgs.pkgsBuildBuild; [
+    stdenv.cc
+    elfutils
+    zlib
+    zstd
+    openssl
+  ]);
 
   hardeningDisable = lib.optionals withBpf [ "zerocallusedregs" ];
 
   BPF_CFLAGS = lib.optionalString withBpf "-fno-stack-protector -Wno-error=unused-command-line-argument";
-  CLANG = lib.optionalString withBpf (lib.getExe pkgs.llvmPackages.clang);
+  # Compiles BPF programs at build time, so it must run on the build machine.
+  CLANG = lib.optionalString withBpf (lib.getExe pkgs.buildPackages.llvmPackages.clang);
 
   # Set AR explicitly so configure can find it (configure checks $AR first)
   AR = "${pkgs.stdenv.cc.bintools.bintools}/bin/${pkgs.stdenv.cc.targetPrefix}ar";
@@ -321,7 +392,7 @@ pkgs.stdenv.mkDerivation rec {
       cd $out/var/lib/pcp/pmns
       export PCP_DIR=$out
       export PCP_CONF=$out/etc/pcp.conf
-      . $out/etc/pcp.env
+      . $out/etc/pcp.env${lib.optionalString isCross "; export PCP_BINADM_DIR=${hostBinadm}  # pmnsmerge runs pmcpp from here"}
 
       # Merge all the root_* files into the combined root file
       # Order matters: root_root first (base), then others.  Only merge
@@ -337,7 +408,7 @@ pkgs.stdenv.mkDerivation rec {
       for f in root_proc root_xfs root_jbd2 root_kvm root_mmv root_bpf root_pmproxy; do
         [ -f "$pmns/$f" ] && merge="$merge $pmns/$f"
       done
-      $out/libexec/pcp/bin/pmnsmerge -a $merge root
+      ${hostBinadm}/pmnsmerge -a $merge root
     )
 
     # Remove runtime state directories
@@ -449,6 +520,14 @@ pkgs.stdenv.mkDerivation rec {
         cp -R "$docdir"/. "$dest"/
         rm -rf "$docdir"
       fi
+    done
+  '' + lib.optionalString isCross ''
+
+    # configure takes python3 from PATH (the build machine's; it runs it to
+    # probe modules), so pcp.conf's PCP_PYTHON_PROG and some scripts name it.
+    # Point them at the target's python3.
+    grep -rlI ${pkgs.buildPackages.python3} "$out" | while read -r f; do
+      substituteInPlace "$f" --replace-quiet ${pkgs.buildPackages.python3} ${pkgs.python3}
     done
   '';
 

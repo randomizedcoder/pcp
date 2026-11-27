@@ -72,6 +72,7 @@ File Structure
 
     build/nix/
     ├── package.nix           # PCP derivation (version from VERSION.pcp)
+    ├── cross.nix             # Cross-compiled PCP (riscv64, aarch64) from x86_64
     ├── nixos-module.nix      # NixOS module for services.pcp
     ├── constants.nix         # Shared configuration constants
     ├── flake.nix             # Orchestrator (at repo root)
@@ -114,6 +115,7 @@ File Structure
     │
     └── tests/
         ├── microvm-test.nix      # MicroVM test script builder
+        ├── cross-test.nix        # Table-driven checks for cross packages
         └── test-all-microvms.nix # Comprehensive test runner
 
 Module Descriptions
@@ -212,6 +214,54 @@ Build and run a MicroVM for local testing (all variants have password SSH enable
 
 See :ref:`nixos-microvms` for full MicroVM documentation.
 
+.. _nix-cross-compiling:
+
+Cross-Compiling Quick Start
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+On x86_64-linux, build PCP for a riscv64 or aarch64 Linux board with nixpkgs'
+cross toolchains (minutes, versus a day or more building natively on a small
+board), then copy it over::
+
+    nix build .#pcp-riscv64                  # or .#pcp-aarch64
+    nix copy --no-check-sigs --to ssh-ng://root@<board> ./result
+
+    # On the board (PCP_DIR locates pcp.conf in the store)
+    PCP_DIR=/nix/store/...-pcp-riscv64-unknown-linux-gnu-7.x.y/share/pcp \
+        /nix/store/...-pcp-riscv64-unknown-linux-gnu-7.x.y/bin/pminfo -L -f kernel.all.load
+
+Tests (table-driven, ``build/nix/tests/cross-test.nix``)::
+
+    nix build .#checks.x86_64-linux.cross-riscv64-smoke   # qemu-user, no hardware
+    nix run .#pcp-cross-test-riscv64 -- <board>           # full table on a board
+
+How it works, in ``package.nix`` behind ``isCross`` (native builds unchanged):
+
+* configure only cross-compiles with a ``config.<os>`` answer file
+  (upstream ships ``config.mingw``); ``config.linux`` is generated from the
+  target platform.  Only 64-bit Linux targets are supported.
+* The build runs ``newhelp``, ``pmieconf``, ``pmgenmap``, ``pmcpp`` and
+  ``pmnsmerge``; when cross-compiling ``src/include/builddefs.in`` takes them
+  from a build-machine PCP via ``$PCP_DIR``, so one is built from the same
+  source.
+* The vendored bpftool builds a bootstrap bpftool for the build machine, so
+  the build machine's compiler and libraries are added as ``depsBuildBuild``.
+* BPF skeletons are generated with ``$(BPFTOOL)``, the target bpftool; the
+  build-machine bootstrap bpftool is used instead.
+* configure records the build machine's python3 (it runs it to probe
+  modules); it is rewritten to the target's after install.
+* ``cross.nix`` carries an overlay for nixpkgs' rrdtool, which does not
+  cross-compile.
+
+Pending upstream:
+
+* ``src/pmdas/bind2/mk.rewrite`` runs ``pmcpp.static`` directly instead of
+  ``$(PMCPP)``, so it is substituted when cross-compiling.
+* The ``sizeof time_t``/``off_t`` and ``__pmResult`` padding probes in
+  ``configure.ac`` run ``./conftest`` even when cross-compiling.  They fail
+  harmlessly for 64-bit targets (empty answers give the LP64 defaults), but
+  should read ``config.<os>`` like the other probes.
+
 OCI Container Quick Start
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -242,6 +292,8 @@ Flake Outputs Reference
      -
    * - ``pcp`` (default)
      - PCP package built from source
+   * - ``pcp-riscv64``, ``pcp-aarch64``
+     - PCP cross-compiled on x86_64-linux (see :ref:`nix-cross-compiling`)
    * - **Base VMs** (pmcd, pmlogger, pmproxy)
      -
    * - ``pcp-microvm``
