@@ -1,0 +1,32 @@
+# build/nix/analysis/anomalies.toml
+#
+# Known static analysis findings, read by the triage step of the
+# pcp-analysis-<tier> builds and by `nix run .#pcp-analysis-triage`.
+#
+# A finding matches an entry when tool, check_id and file match, and
+# code_anchor (if set) is found within anchor_window lines of the reported
+# line.  The anchor is a piece of the source text, so an entry keeps
+# working when line numbers change.
+#
+# status:
+#   false-positive  reviewed, not a bug           -> left out of the reports
+#   wont-fix        real, but accepted             -> left out of the reports
+#   needs-review    keep it visible for a maintainer -> anomalies-flagged.txt
+#   confirmed-bug   real, tracked until fixed      -> anomalies-flagged.txt
+#
+# Fields: id, tool, check_id, file (exact or glob), code_anchor,
+# anchor_window (default 5), status, reason, remediations (list),
+# reviewer, date, github_issue, note.
+#
+# Example:
+#
+# [[anomaly]]
+# id = "PCP-0001"
+# tool = "cppcheck"
+# check_id = "arrayIndexOutOfBounds"
+# file = "src/pmdas/darwin_proc/pmda.c"
+# code_anchor = "indomtab["
+# status = "false-positive"
+# reason = "darwin only code; cppcheck runs with -D__linux__"
+# reviewer = "..."
+# date = "2026-11-27"

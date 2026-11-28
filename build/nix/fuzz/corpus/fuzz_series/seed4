@@ -1,0 +1,1 @@
+kernel.all.cpu.user{instance.name=~"cpu[0-9]"}[start:"-1hour",end:"now"]

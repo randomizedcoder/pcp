@@ -1,0 +1,1 @@
+mkconst(5, type=u64, semantics=counter, units=Kbyte/sec)

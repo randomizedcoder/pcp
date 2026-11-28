@@ -1,0 +1,169 @@
+# build/nix/analysis/rules/semgrep-c.yaml
+#
+# semgrep rules for the PCP C sources (pcp-analysis-semgrep).  Kept in
+# the repository so the analysis runs offline in the nix sandbox.
+# Based on the rocm-systems nix analysis rules, C only.
+rules:
+  # --- unbounded string and memory functions ---
+  - id: unsafe-sprintf
+    pattern-either:
+      - pattern: sprintf($BUF, ...)
+      - pattern: vsprintf($BUF, ...)
+    message: sprintf() has no bounds check; use pmsprintf() or snprintf()
+    languages: [c]
+    severity: WARNING
+  - id: unsafe-strcpy
+    pattern: strcpy($DST, $SRC)
+    message: strcpy() has no bounds check; use pmstrncpy() or strncpy()
+    languages: [c]
+    severity: WARNING
+  - id: unsafe-strcat
+    pattern: strcat($DST, $SRC)
+    message: strcat() has no bounds check; use pmstrncat() or strncat()
+    languages: [c]
+    severity: WARNING
+  - id: unsafe-gets
+    pattern: gets($BUF)
+    message: gets() can always overflow its buffer; use fgets()
+    languages: [c]
+    severity: ERROR
+  - id: strncpy-strlen-src
+    pattern: strncpy($D, $S, strlen($S))
+    message: strncpy() with strlen(src) as the length has no bounds check
+    languages: [c]
+    severity: WARNING
+  - id: memcpy-sizeof-pointer
+    patterns:
+      - pattern-inside: |
+          $T *$P;
+          ...
+      - pattern-either:
+          - pattern: memcpy($D, $S, sizeof($P))
+          - pattern: memset($P, $V, sizeof($P))
+    message: sizeof() of a pointer gives the pointer size, not the size of the data
+    languages: [c]
+    severity: WARNING
+  - id: memset-zero-length
+    pattern: memset($B, $V, 0)
+    message: memset() with length 0 does nothing; are the arguments swapped?
+    languages: [c]
+    severity: WARNING
+  - id: realloc-self-assign
+    pattern: $P = realloc($P, $N)
+    message: when realloc() fails the old pointer is lost (memory leak)
+    languages: [c]
+    severity: WARNING
+  - id: alloc-size-multiply
+    pattern-either:
+      - pattern: malloc($A * $B)
+      - pattern: realloc($P, $A * $B)
+    message: the size multiply can overflow; check it, or use calloc()
+    languages: [c]
+    severity: INFO
+
+  # --- format strings ---
+  - id: format-not-literal
+    patterns:
+      - pattern-either:
+          - pattern: printf($FMT, ...)
+          - pattern: fprintf($F, $FMT, ...)
+          - pattern: snprintf($B, $N, $FMT, ...)
+          - pattern: pmsprintf($B, $N, $FMT, ...)
+          - pattern: syslog($P, $FMT, ...)
+          - pattern: pmNotifyErr($P, $FMT, ...)
+      # not a literal, and not a MACRO (as in "%" FMT_INT64, $FMT is the macro)
+      - metavariable-regex:
+          metavariable: $FMT
+          regex: '^(?![A-Z][A-Za-z0-9_]*$)[^"]*$'
+    message: the format string is not a literal; check it cannot come from input
+    languages: [c]
+    severity: WARNING
+
+  # --- files, processes and races ---
+  - id: toctou-access
+    pattern: access($PATH, ...)
+    message: access() then open() is a race (TOCTOU); open first, then check
+    languages: [c]
+    severity: WARNING
+  - id: chmod-chown-on-path
+    pattern-either:
+      - pattern: chmod($PATH, $MODE)
+      - pattern: chown($PATH, $U, $G)
+      - pattern: lchown($PATH, $U, $G)
+    message: chmod()/chown() on a path can race; prefer fchmod()/fchown() on an open fd
+    languages: [c]
+    severity: INFO
+  - id: insecure-tempfile
+    pattern-either:
+      - pattern: tmpnam(...)
+      - pattern: tempnam(...)
+      - pattern: mktemp(...)
+    message: this temporary file name can be taken by another process; use mkstemp()
+    languages: [c]
+    severity: WARNING
+  - id: shell-command
+    pattern-either:
+      - pattern: system($CMD)
+      - pattern: popen($CMD, $MODE)
+    message: the command runs in a shell; check it cannot hold untrusted input
+    languages: [c]
+    severity: INFO
+  - id: vfork-usage
+    pattern: vfork()
+    message: vfork() shares memory with the parent; prefer fork() or posix_spawn()
+    languages: [c]
+    severity: WARNING
+  - id: signal-not-sigaction
+    pattern: signal($SIG, $H)
+    message: signal() behaviour differs between platforms; prefer sigaction()
+    languages: [c]
+    severity: INFO
+
+  # --- thread safety (libpcp is thread-safe) ---
+  - id: thread-unsafe-libc
+    pattern-either:
+      - pattern: strtok(...)
+      - pattern: strerror(...)
+      - pattern: localtime(...)
+      - pattern: gmtime(...)
+      - pattern: ctime(...)
+      - pattern: asctime(...)
+      - pattern: getpwnam(...)
+      - pattern: getpwuid(...)
+      - pattern: getgrnam(...)
+      - pattern: getgrgid(...)
+      - pattern: gethostbyname(...)
+      - pattern: readdir(...)
+    message: this libc call uses static storage and is not thread-safe; use the _r form
+    languages: [c]
+    severity: INFO
+
+  # --- other ---
+  - id: insecure-rand
+    pattern-either:
+      - pattern: rand()
+      - pattern: srand(...)
+    message: rand() is predictable; do not use it for security
+    languages: [c]
+    severity: INFO
+  - id: atoi-no-error-check
+    pattern-either:
+      - pattern: atoi(...)
+      - pattern: atol(...)
+      - pattern: atof(...)
+    message: atoi()/atol()/atof() cannot report bad input; use strtol()/strtod()
+    languages: [c]
+    severity: INFO
+  - id: alloca-usage
+    pattern: alloca($SIZE)
+    message: alloca() has no overflow check on the stack size
+    languages: [c]
+    severity: WARNING
+  - id: assert-side-effect
+    pattern-either:
+      - pattern: assert($X = $Y)
+      - pattern: assert($X++)
+      - pattern: assert($X--)
+    message: the side effect in assert() is lost when NDEBUG is set
+    languages: [c]
+    severity: ERROR

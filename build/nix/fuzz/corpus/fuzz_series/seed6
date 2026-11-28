@@ -1,0 +1,1 @@
+sum_inst(mem.util.free) / 1024
