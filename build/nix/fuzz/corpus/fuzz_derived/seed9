@@ -1,0 +1,1 @@
+min_inst(disk.dev.read) - max_inst(disk.dev.write)

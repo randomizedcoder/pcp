@@ -96,6 +96,22 @@ File Structure
     ├── vm-test.nix           # NixOS VM integration test
     ├── test-lib.nix          # Shared test functions
     │
+    ├── analysis/             # Static analysis (manual targets)
+    │   ├── default.nix       # Tools, tiers, triage targets
+    │   ├── ccwrap.py         # CC wrapper: absolute paths, compile_commands
+    │   ├── diagpaths.py      # Repo paths for gcc diagnostics in a make log
+    │   ├── anomalies.toml    # Known findings (false positives, bugs)
+    │   ├── rules/            # Vendored semgrep and coccinelle rules
+    │   └── triage/           # Python triage: dedup, cross-tool, scoring
+    │
+    ├── fuzz/                 # libFuzzer harnesses (manual targets)
+    │   ├── default.nix       # Harness builds, runner, run/deep/selftest/cov
+    │   ├── libs.nix          # libpcp + libpcp_web built for fuzzing
+    │   ├── run-fuzzers.sh    # Runs harnesses, sorts crashes by signature
+    │   ├── harness/          # fuzz_*.c, one per parser
+    │   ├── corpus/           # Seed inputs, one directory per harness
+    │   └── dict/             # libFuzzer dictionaries
+    │
     ├── patches/              # Nix-specific patches
     │   ├── gnumakefile-nix-fixes.patch
     │   ├── python-libpcp-nix.patch
@@ -170,6 +186,15 @@ Module Descriptions
      - Modular lifecycle testing framework for fine-grained MicroVM validation.
        Provides individual phase scripts (build, process, console, services,
        metrics, shutdown) and full lifecycle tests per variant.
+   * - ``analysis/``
+     - Static analysis of the PCP sources: 11 tools (C, shell, Python) in
+       three tiers, and a triage step that ranks the findings.
+       Report only; run by hand. See `Static Analysis`_.
+   * - ``fuzz/``
+     - libFuzzer + ASan + UBSan harnesses for libpcp and libpcp_web parsers
+       (PDU decoders, host specs, labels, derived metrics, time, units,
+       metric specs, event records, archive labels, pmseries queries).
+       Run by hand. See `Fuzzing`_.
 
 Quick Start
 -----------
@@ -326,6 +351,36 @@ Flake Outputs Reference
      - Namespace YAML only
    * - ``pcp-k8s-manifest-daemonset``
      - DaemonSet YAML only
+   * - **Static Analysis** (manual, report only)
+     -
+   * - ``pcp-analysis-quick``
+     - cppcheck, flawfinder, shellcheck, ruff, bandit (+ triage)
+   * - ``pcp-analysis-standard``
+     - quick + clang-tidy, semgrep, coccinelle (+ triage)
+   * - ``pcp-analysis-deep``
+     - standard + scan-build, gcc ``-fanalyzer``, gcc extra warnings (+ triage)
+   * - ``pcp-analysis-all``
+     - deep + ``pcp-fuzz-run``; the fuzzer crashes are triaged too
+   * - ``pcp-analysis-<tool>``
+     - One tool (see `Static Analysis`_ for the list)
+   * - ``pcp-analysis-triage`` (app)
+     - The triage report on a result, with options (``--category`` ...)
+   * - ``pcp-analysis-triage-test``
+     - Unit tests of the triage parsers and matching
+   * - **Fuzzing** (manual)
+     -
+   * - ``pcp-fuzz``
+     - All harnesses, seed corpus and ``bin/pcp-run-fuzzers``
+   * - ``pcp-fuzz-run``
+     - Bounded run (20s per harness) as a build: summary and crashes
+   * - ``pcp-fuzz-deep`` (app)
+     - Long run: fork mode, dictionaries, ``FUZZ_DEEP_TIME`` per harness
+   * - ``pcp-fuzz-selftest``
+     - Fails unless ASan finds a planted overflow (checks the fuzz build)
+   * - ``pcp-fuzz-cov``
+     - llvm-cov line coverage of libpcp from a short run
+   * - ``pcp-fuzz-libs``
+     - The instrumented libpcp/libpcp_web build the harnesses link to
    * - **Checks**
      -
    * - ``vm-test``
@@ -1836,6 +1891,280 @@ applying it to an existing cluster::
 The standalone manifests use the ``pcp`` namespace by default (the test suite
 overrides this to ``pcp-test`` for isolation). Resource limits, image settings,
 and host mount paths are all defined in ``build/nix/k8s-manifests/constants.nix``.
+
+Static Analysis
+---------------
+
+The flake has static analysis targets for the PCP sources (C, shell and
+Python). They are run by hand only (they are not in ``nix flake check`` or
+CI). The tools report findings, they do not fail on them. A build fails
+only if the tool setup is broken (for example an empty compile database).
+The design and the triage step are taken from the rocm-systems nix
+analysis.
+
+::
+
+    nix build .#pcp-analysis-quick      # source only tools (minutes)
+    nix build .#pcp-analysis-standard   # + clang-tidy, semgrep, coccinelle
+    nix build .#pcp-analysis-deep       # + scan-build, gcc -fanalyzer,
+                                        #   gcc extra warnings (slow)
+    nix build .#pcp-analysis-all        # deep + pcp-fuzz-run crashes
+    cat result/summary.txt
+    less result/triage/high-confidence.txt
+
+    nix build .#pcp-analysis-clang-tidy # one tool only
+    less result/report.txt
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 15 65
+
+   * - Tool
+     - Tier
+     - What it does
+   * - ``cppcheck``
+     - quick
+     - ``--enable=warning,performance,portability`` on every PCP ``.c`` file,
+       after ``configure`` and ``make -C src/include``. No full build.
+   * - ``flawfinder``
+     - quick
+     - Risky C calls (``strcpy``, ``sscanf("%s")``, ``chmod`` on a path
+       ...), with a CWE number and a risk level 1-5.
+   * - ``shellcheck``
+     - quick
+     - Shell scripts in ``src/``, ``build/`` and ``scripts/`` (``*.sh`` and
+       files with a ``sh``/``bash`` ``#!`` line). ``qa/`` is left out.
+   * - ``ruff``
+     - quick
+     - Python files (``*.py``, ``*.python``, ``#!`` python): pyflakes
+       errors, syntax errors and bugbear (``F,E9,B,PLE``), not style.
+   * - ``bandit``
+     - quick
+     - Security checks on the same Python files.
+   * - ``clang-tidy``
+     - standard
+     - Full build with ``ccwrap.py`` as ``CC`` to record
+       ``compile_commands.json`` (``bear`` cannot see the compiles through
+       the nix cc-wrapper), then
+       ``run-clang-tidy`` with ``bugprone-*``, ``cert-*``,
+       ``clang-analyzer-*`` and ``misc-*``. Checks for common PCP idioms
+       are off (assignment in ``if``, ``atoi``, narrowing, unused
+       parameters, implicit ``void *`` casts, "use ``fprintf_s``" ...), as
+       they would bury the rest; the list is in
+       ``build/nix/analysis/default.nix``. The
+       compile database is kept in ``result/compile_commands.json``.
+   * - ``semgrep``
+     - standard
+     - The C rules in ``build/nix/analysis/rules/semgrep-c.yaml``: unbounded
+       string calls, ``sizeof`` of a pointer, ``p = realloc(p, n)``,
+       non-literal format strings, TOCTOU, thread unsafe libc calls ...
+       ``result/report.json`` is the full semgrep output.
+   * - ``coccinelle``
+     - standard
+     - The semantic patches in ``build/nix/analysis/rules/coccinelle/``:
+       allocation used before a NULL check, use after ``free()``, double
+       ``free()``, ``realloc()`` leak. The ``free()`` rules match only when
+       every path from the ``free()`` reaches the second use, which keeps
+       out most false positives from error paths and loops.
+   * - ``scan-build``
+     - deep
+     - The clang static analyzer over the full build. ``result/html/`` has
+       the browsable reports (``scan-view result/html/*``).
+   * - ``gcc-analyzer``
+     - deep
+     - Full build with gcc ``-fanalyzer``; the ``-Wanalyzer-*`` warnings.
+       The slowest tool.
+   * - ``gcc-warnings``
+     - deep
+     - Full build with extra gcc warnings that find bugs
+       (``-Wformat=2 -Wformat-signedness -Wnull-dereference
+       -Wduplicated-cond -Wlogical-op -Wstringop-overflow=4`` ...; the
+       list is ``gccWarningFlags`` in ``default.nix``).
+
+Output of each tool (``nix build .#pcp-analysis-<tool>``):
+
+- ``report.txt`` - one finding per line, ``file:line:col: ...``
+- ``count.txt`` - number of findings
+
+A tier has one directory per tool (``result/<tool>/report.txt``),
+``summary.txt``, and ``triage/``. Findings in ``vendor/``,
+``src/external/``, ``deps/``, ``qa/`` and generated bison/flex files are
+left out. The builds use the same ``configure`` options as
+``nix build .#pcp``, except the bpf PMDAs are off (they build vendored
+libbpf and bpftool). For the gcc tools, ``ccwrap.py`` gives the compiler
+absolute paths, and ``diagpaths.py`` reads the build log so each warning
+has its path from the repo root.
+
+Triage
+^^^^^^
+
+Each tier ends with a triage step (Python, in
+``build/nix/analysis/triage/``). It reads every tool's report, removes
+duplicates, matches known findings in ``anomalies.toml``, and ranks the
+rest. ``result/triage/`` has:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - File
+     - Contents
+   * - ``high-confidence.txt``
+     - Findings most likely to be real bugs, highest score first. Memory
+       safety findings (use after free, double free, out of bounds) and
+       fuzzer crashes are always here. Other bug classes (NULL
+       dereference, leak, uninitialized value ...) are here when a second
+       tool family reports the same place (within 3 lines), or when they
+       are errors in a security sensitive path. flawfinder and semgrep
+       count as one family, and so do scan-build and clang-tidy. Lint
+       tools (shellcheck, ruff) are not in this list.
+   * - ``cross-ref.txt``
+     - Places reported by two or more tool families
+   * - ``summary.txt``
+     - Count per check, split into product/test code and security
+       sensitive paths (pmcd, pmproxy, PDU decoding, authentication ...)
+   * - ``full-report.txt``
+     - The top 200 findings by score
+   * - ``count.txt``
+     - Number of high-confidence findings
+   * - ``anomalies-*.txt``
+     - Findings matched in ``anomalies.toml`` (suppressed, or flagged for
+       review)
+
+Run the triage by hand on any result, from the repo root, to drill in::
+
+    nix run .#pcp-analysis-triage -- result/ --summary
+    nix run .#pcp-analysis-triage -- result/ --category memleakOnRealloc
+    nix run .#pcp-analysis-triage -- result/ --cross-ref
+    nix run .#pcp-analysis-triage -- result/ --new-only   # exit 1 if any
+
+The app reads ``build/nix/analysis/anomalies.toml`` from the working tree,
+so a new entry takes effect without a rebuild. An entry names the tool,
+check and file (or glob), and a ``code_anchor``: a piece of the source text
+that must be within ``anchor_window`` lines of the finding, so the entry
+still matches when line numbers change::
+
+    [[anomaly]]
+    id = "PCP-0001"
+    tool = "cppcheck"
+    check_id = "arrayIndexOutOfBounds"
+    file = "src/pmdas/darwin_proc/pmda.c"
+    code_anchor = "indomtab["
+    status = "false-positive"   # or wont-fix, needs-review, confirmed-bug
+    reason = "darwin only code; cppcheck runs with -D__linux__"
+
+``false-positive`` and ``wont-fix`` entries are left out of the reports;
+``needs-review`` and ``confirmed-bug`` entries are listed in
+``anomalies-flagged.txt``. The triage code has table driven unit tests:
+``nix build .#pcp-analysis-triage-test``.
+
+To add a tool: write it with ``mkSourceTool`` (reads the source) or
+``mkTool`` (needs a configured or built tree) in ``default.nix``, so it
+writes ``report.txt`` as ``file:line:col: severity: message [check]``; add
+it to ``tools`` and a tier; and add its parser to
+``triage/parsers/__init__.py``.
+
+Fuzzing
+-------
+
+The flake has libFuzzer harnesses for parsers in libpcp and libpcp_web
+that read untrusted input (from the network, archives, or config files).
+They are run by hand only. ``nix build .#pcp-analysis-all`` adds the
+crashes of a ``pcp-fuzz-run`` to the static analysis triage (see `Triage`_).
+
+::
+
+    nix build .#pcp-fuzz-selftest        # check the fuzz build can find a bug
+    nix build .#pcp-fuzz-run             # 20s per harness, as a build
+    cat result/summary.txt
+
+    nix build .#pcp-fuzz                 # harnesses + runner
+    FUZZ_TIME=300 ./result/bin/pcp-run-fuzzers /tmp/pcp-fuzz-out
+
+    nix run .#pcp-fuzz-deep -- /tmp/pcp-fuzz-deep   # long run, all cores
+    nix build .#pcp-fuzz-cov && cat result/summary.txt
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Harness
+     - Target
+   * - ``fuzz_pdu``
+     - ``__pmDecode*()`` for every PDU type (as pmcd and clients read them)
+   * - ``fuzz_hostspec``
+     - ``__pmParseHostAttrsSpec()`` / ``__pmParseHostSpec()`` and the unparse
+       round trip (``pcp://host:port?attrs`` URLs)
+   * - ``fuzz_labels``
+     - ``__pmParseLabelSet()`` label JSON, and ``pmMergeLabels()``
+   * - ``fuzz_derived``
+     - ``pmRegisterDerivedMetric()``, the derived metric expression parser
+   * - ``fuzz_time``
+     - ``pmParseInterval()``, ``__pmParseCtime()``, ``pmParseTimeWindow()``
+   * - ``fuzz_units``
+     - ``pmParseUnitsStr()``
+   * - ``fuzz_metricspec``
+     - ``pmParseMetricSpec()``, host and archive forms
+   * - ``fuzz_events``
+     - ``pmUnpackEventRecords()`` / ``pmUnpackHighResEventRecords()``
+   * - ``fuzz_loglabel``
+     - ``__pmLogLoadLabel()``, the archive label record (v2 and v3)
+   * - ``fuzz_series``
+     - ``series_parse()``, the pmseries query language (pmproxy
+       ``/series/query``)
+
+How it is built:
+
+- ``pcp-fuzz-libs`` (``fuzz/libs.nix``) builds only ``src/include``,
+  ``src/libpcp``, ``src/libpcp_pmda``, ``src/libpcp_mmv``, ``src/libvalkey``
+  and ``src/libpcp_web`` with clang and
+  ``-fsanitize=fuzzer-no-link,address,undefined``. For this build only,
+  ``-Wl,--no-undefined`` and ``check-statics`` are turned off (the
+  sanitizer runtime is in each harness, not in the libraries).
+- Each harness is linked with ``-fsanitize=fuzzer,address,undefined``.
+  ``fuzz_series`` links the ``libpcp_web.a`` objects, as ``series_parse()``
+  is not exported.
+- ``corpus/<harness>/`` has seed inputs; ``dict/<harness>.dict`` is used
+  when present.
+
+Runner environment (``pcp-run-fuzzers``, ``pcp-fuzz-run``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Variable
+     - Meaning
+   * - ``FUZZ_TIME``
+     - Seconds per harness (default 60)
+   * - ``FUZZ_FORKS``
+     - libFuzzer ``-fork=N`` with ``-ignore_crashes=1`` (default 0, in-process)
+   * - ``FUZZ_MAXLEN``
+     - libFuzzer ``-max_len``
+   * - ``FUZZ_ONLY``
+     - Space separated harness names to run (default all)
+   * - ``FUZZ_LEAKS``
+     - ``1`` turns on LeakSanitizer (default off)
+   * - ``FUZZ_TIMEOUT``
+     - Seconds one input may run before it is kept as a hang (default 10)
+   * - ``FUZZ_DEEP_TIME`` / ``FUZZ_DEEP_FORKS`` / ``FUZZ_DEEP_MAXLEN``
+     - ``pcp-fuzz-deep`` only: 600s, ``nproc``, 65536
+
+The output directory has one working corpus and log per harness,
+``summary.txt``, ``count.txt``, ``distinct_count.txt`` and
+``crashes/<harness>/``. Crashes are kept once per sanitizer ``SUMMARY``
+line, as ``crash-<sig>`` with ``repro-<sig>.txt`` (the sanitizer report).
+
+To reproduce a crash, run the harness on the file. The harness binaries set
+their own ``PCP_CONF`` and symbolizer, so no environment is needed::
+
+    nix build .#pcp-fuzz
+    ./result/bin/fuzz_pdu /tmp/pcp-fuzz-out/crashes/fuzz_pdu/crash-123456
+
+To add a harness: add ``harness/fuzz_<name>.c`` with
+``LLVMFuzzerTestOneInput()`` (include ``fuzz_common.h``), seeds in
+``corpus/fuzz_<name>/``, optionally ``dict/fuzz_<name>.dict``, and the name
+to ``harnesses`` in ``fuzz/default.nix``.
 
 Development Shell
 -----------------

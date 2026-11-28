@@ -1,0 +1,1 @@
+delta(sample.seconds) == 0 || anon(PM_TYPE_DOUBLE)

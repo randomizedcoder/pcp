@@ -26,6 +26,24 @@
 #   nix run .#pcp-vm-stop                   # Stop VM
 #   sudo nix run .#pcp-network-teardown     # Cleanup (requires sudo)
 #
+# Static Analysis (Linux, manual only, not in `nix flake check`):
+#   nix build .#pcp-analysis-quick     # cppcheck flawfinder shellcheck ruff bandit
+#   nix build .#pcp-analysis-standard  # + clang-tidy semgrep coccinelle
+#   nix build .#pcp-analysis-deep      # + scan-build gcc-analyzer gcc-warnings
+#   nix build .#pcp-analysis-all       # deep + pcp-fuzz-run crashes
+#   cat result/summary.txt             # per tool: result/<tool>/report.txt
+#   less result/triage/high-confidence.txt   # ranked, likely real bugs
+#   nix run .#pcp-analysis-triage -- result/ --category <check>
+#   # one tool: nix build .#pcp-analysis-<tool>
+#   # known findings: build/nix/analysis/anomalies.toml
+#
+# Fuzzing (Linux, libFuzzer + ASan + UBSan, manual only):
+#   nix build .#pcp-fuzz-selftest      # check the fuzz build can find a bug
+#   nix build .#pcp-fuzz-run           # 20 s per harness; result/summary.txt
+#   nix run .#pcp-fuzz-deep -- out/    # long run: FUZZ_DEEP_TIME=600 (s)
+#   nix build .#pcp-fuzz-cov           # libpcp line coverage from a short run
+#   nix build .#pcp-fuzz && FUZZ_TIME=300 ./result/bin/pcp-run-fuzzers out/
+#
 # See also: ./docs/HowTos/nix/index.rst
 #
 {
@@ -153,6 +171,18 @@
           }
         );
 
+        # Static analysis and fuzzing (Linux only, manual: not in checks)
+        analysis = lib.optionalAttrs pkgs.stdenv.isLinux (
+          import (nixDir + "/analysis") {
+            inherit pkgs lib;
+            src = self;
+            fuzzRun = fuzz.packages.pcp-fuzz-run;
+          }
+        );
+        fuzz = lib.optionalAttrs pkgs.stdenv.isLinux (
+          import (nixDir + "/fuzz") { inherit pkgs lib; src = self; }
+        );
+
       in
       {
         packages = {
@@ -175,6 +205,9 @@
           // k8sManifests.packages
           # Test-all runner
           // testAll.packages
+          # Static analysis and fuzzing
+          // (analysis.packages or { })
+          // (fuzz.packages or { })
         );
 
         checks = lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -267,6 +300,9 @@
           // k8sTest.apps
           # Test-all runner
           // testAll.apps
+          # Fuzzing
+          // (analysis.apps or { })
+          // (fuzz.apps or { })
         );
       }
     );

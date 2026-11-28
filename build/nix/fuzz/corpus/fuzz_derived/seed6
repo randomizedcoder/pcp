@@ -1,0 +1,1 @@
+matchinst(/sd[a-z]/, disk.dev.read)
